@@ -8,11 +8,22 @@ nav_order: 500
 Aider can connect to [models provided by OpenRouter](https://openrouter.ai/models?o=top-weekly):
 You'll need an [OpenRouter API key](https://openrouter.ai/keys).
 
-```
-python -m pip install -U aider-chat
+First, install aider:
 
+{% include install.md %}
+
+Then configure your API keys:
+
+```
 export OPENROUTER_API_KEY=<key> # Mac/Linux
 setx   OPENROUTER_API_KEY <key> # Windows, restart shell after setx
+```
+
+Start working with aider and OpenRouter on your codebase:
+
+```bash
+# Change directory into your codebase
+cd /to/your/project
 
 # Or any other open router model
 aider --model openrouter/<provider>/<model>
@@ -22,16 +33,6 @@ aider --list-models openrouter/
 ```
 
 In particular, many aider users access Sonnet via OpenRouter:
-
-```
-python -m pip install -U aider-chat
-
-export OPENROUTER_API_KEY=<key> # Mac/Linux
-setx   OPENROUTER_API_KEY <key> # Windows, restart shell after setx
-
-aider --model openrouter/anthropic/claude-3.5-sonnet
-```
-
 
 {: .tip }
 If you get errors, check your
@@ -44,17 +45,17 @@ to allow use of all models.
 OpenRouter often has multiple providers serving each model.
 You can control which OpenRouter providers are used for your requests in two ways:
 
-1. By "ignoring" certain providers in your 
+1. By "ignoring" certain providers in your
 [OpenRouter account settings](https://openrouter.ai/settings/preferences).
 This disables those named providers across all the models that you access via OpenRouter.
 
 2. By configuring "provider routing" in a `.aider.model.settings.yml` file.
 
-Place that file in your home directory or the root if your git project, with
+Place that file in your home directory or the root of your git project, with
 entries like this:
 
 ```yaml
-- name: openrouter/anthropic/claude-3.5-sonnet
+- name: openrouter/anthropic/claude-3.7-sonnet
   extra_params:
     extra_body:
       provider:

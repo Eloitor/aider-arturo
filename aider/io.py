@@ -1,7 +1,9 @@
 import base64
 import functools
 import os
+import shutil
 import signal
+import subprocess
 import time
 import webbrowser
 from collections import defaultdict
@@ -16,6 +18,7 @@ from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.filters import Condition, is_searching
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.lexers import PygmentsLexer
 from prompt_toolkit.output.vt100 import is_dumb_terminal
@@ -23,6 +26,7 @@ from prompt_toolkit.shortcuts import CompleteStyle, PromptSession
 from prompt_toolkit.styles import Style
 from pygments.lexers import MarkdownLexer, guess_lexer_for_filename
 from pygments.token import Token
+from rich.color import ColorParseError
 from rich.columns import Columns
 from rich.console import Console
 from rich.markdown import Markdown
@@ -32,7 +36,22 @@ from rich.text import Text
 from aider.mdstream import MarkdownStream
 
 from .dump import dump  # noqa: F401
+from .editor import pipe_editor
 from .utils import is_image_file
+
+# Constants
+NOTIFICATION_MESSAGE = "Aider is waiting for your input"
+
+
+def ensure_hash_prefix(color):
+    """Ensure hex color values have a # prefix."""
+    if not color:
+        return color
+    if isinstance(color, str) and color.strip() and not color.startswith("#"):
+        # Check if it's a valid hex color (3 or 6 hex digits)
+        if all(c in "0123456789ABCDEFabcdef" for c in color) and len(color) in (3, 6):
+            return f"#{color}"
+    return color
 
 
 def restore_multiline(func):
@@ -50,6 +69,13 @@ def restore_multiline(func):
             self.multiline_mode = orig_multiline
 
     return wrapper
+
+
+class CommandCompletionException(Exception):
+    """Raised when a command should use the normal autocompleter instead of
+    command-specific completion."""
+
+    pass
 
 
 @dataclass
@@ -170,14 +196,23 @@ class AutoCompleter(Completer):
             return
 
         if text[0] == "/":
-            yield from self.get_command_completions(document, complete_event, text, words)
-            return
+            try:
+                yield from self.get_command_completions(document, complete_event, text, words)
+                return
+            except CommandCompletionException:
+                # Fall through to normal completion
+                pass
 
         candidates = self.words
         candidates.update(set(self.fname_to_rel_fnames))
         candidates = [word if type(word) is tuple else (word, word) for word in candidates]
 
         last_word = words[-1]
+
+        # Only provide completions if the user has typed at least 3 characters
+        if len(last_word) < 3:
+            return
+
         completions = []
         for word_match, word_insert in candidates:
             if word_match.lower().startswith(last_word.lower()):
@@ -196,6 +231,8 @@ class InputOutput:
     num_error_outputs = 0
     num_user_asks = 0
     clipboard_watcher = None
+    bell_on_next_input = False
+    notifications_command = None
 
     def __init__(
         self,
@@ -224,25 +261,40 @@ class InputOutput:
         file_watcher=None,
         multiline_mode=False,
         root=".",
+        notifications=False,
+        notifications_command=None,
     ):
         self.placeholder = None
         self.interrupted = False
         self.never_prompts = set()
         self.editingmode = editingmode
         self.multiline_mode = multiline_mode
+        self.bell_on_next_input = False
+        self.notifications = notifications
+        if notifications and notifications_command is None:
+            self.notifications_command = self.get_default_notification_command()
+        else:
+            self.notifications_command = notifications_command
+
         no_color = os.environ.get("NO_COLOR")
         if no_color is not None and no_color != "":
             pretty = False
 
-        self.user_input_color = user_input_color if pretty else None
-        self.tool_output_color = tool_output_color if pretty else None
-        self.tool_error_color = tool_error_color if pretty else None
-        self.tool_warning_color = tool_warning_color if pretty else None
-        self.assistant_output_color = assistant_output_color
-        self.completion_menu_color = completion_menu_color if pretty else None
-        self.completion_menu_bg_color = completion_menu_bg_color if pretty else None
-        self.completion_menu_current_color = completion_menu_current_color if pretty else None
-        self.completion_menu_current_bg_color = completion_menu_current_bg_color if pretty else None
+        self.user_input_color = ensure_hash_prefix(user_input_color) if pretty else None
+        self.tool_output_color = ensure_hash_prefix(tool_output_color) if pretty else None
+        self.tool_error_color = ensure_hash_prefix(tool_error_color) if pretty else None
+        self.tool_warning_color = ensure_hash_prefix(tool_warning_color) if pretty else None
+        self.assistant_output_color = ensure_hash_prefix(assistant_output_color)
+        self.completion_menu_color = ensure_hash_prefix(completion_menu_color) if pretty else None
+        self.completion_menu_bg_color = (
+            ensure_hash_prefix(completion_menu_bg_color) if pretty else None
+        )
+        self.completion_menu_current_color = (
+            ensure_hash_prefix(completion_menu_current_color) if pretty else None
+        )
+        self.completion_menu_current_bg_color = (
+            ensure_hash_prefix(completion_menu_current_bg_color) if pretty else None
+        )
 
         self.code_theme = code_theme
 
@@ -256,6 +308,12 @@ class InputOutput:
         self.yes = yes
 
         self.input_history_file = input_history_file
+        if self.input_history_file:
+            try:
+                Path(self.input_history_file).parent.mkdir(parents=True, exist_ok=True)
+            except (PermissionError, OSError) as e:
+                self.tool_warning(f"Could not create directory for input history: {e}")
+                self.input_history_file = None
         self.llm_history_file = llm_history_file
         if chat_history_file is not None:
             self.chat_history_file = Path(chat_history_file)
@@ -310,6 +368,35 @@ class InputOutput:
         self.file_watcher = file_watcher
         self.root = root
 
+        # Validate color settings after console is initialized
+        self._validate_color_settings()
+
+    def _validate_color_settings(self):
+        """Validate configured color strings and reset invalid ones."""
+        color_attributes = [
+            "user_input_color",
+            "tool_output_color",
+            "tool_error_color",
+            "tool_warning_color",
+            "assistant_output_color",
+            "completion_menu_color",
+            "completion_menu_bg_color",
+            "completion_menu_current_color",
+            "completion_menu_current_bg_color",
+        ]
+        for attr_name in color_attributes:
+            color_value = getattr(self, attr_name, None)
+            if color_value:
+                try:
+                    # Try creating a style to validate the color
+                    RichStyle(color=color_value)
+                except ColorParseError as e:
+                    self.console.print(
+                        "[bold red]Warning:[/bold red] Invalid configuration for"
+                        f" {attr_name}: '{color_value}'. {e}. Disabling this color."
+                    )
+                    setattr(self, attr_name, None)  # Reset invalid color to None
+
     def _get_style(self):
         style_dict = {}
         if not self.pretty:
@@ -335,9 +422,9 @@ class InputOutput:
         # Conditionally add 'completion-menu.completion.current' style
         completion_menu_current_style = []
         if self.completion_menu_current_bg_color:
-            completion_menu_current_style.append(f"bg:{self.completion_menu_current_bg_color}")
+            completion_menu_current_style.append(self.completion_menu_current_bg_color)
         if self.completion_menu_current_color:
-            completion_menu_current_style.append(self.completion_menu_current_color)
+            completion_menu_current_style.append(f"bg:{self.completion_menu_current_color}")
         if completion_menu_current_style:
             style_dict["completion-menu.completion.current"] = " ".join(
                 completion_menu_current_style
@@ -368,7 +455,7 @@ class InputOutput:
             return self.read_image(filename)
 
         try:
-            with open(str(filename), "r", encoding=self.encoding, errors="replace") as f:
+            with open(str(filename), "r", encoding=self.encoding) as f:
                 return f.read()
         except FileNotFoundError:
             if not silent:
@@ -444,6 +531,9 @@ class InputOutput:
     ):
         self.rule()
 
+        # Ring the bell if needed
+        self.ring_bell()
+
         rel_fnames = list(rel_fnames)
         show = ""
         if rel_fnames:
@@ -451,11 +541,16 @@ class InputOutput:
                 get_rel_fname(fname, root) for fname in (abs_read_only_fnames or [])
             ]
             show = self.format_files_for_input(rel_fnames, rel_read_only_fnames)
+
+        prompt_prefix = ""
         if edit_format:
-            show += edit_format
+            prompt_prefix += edit_format
         if self.multiline_mode:
-            show += (" " if edit_format else "") + "multi"
-        show += "> "
+            prompt_prefix += (" " if edit_format else "") + "multi"
+        prompt_prefix += "> "
+
+        show += prompt_prefix
+        self.prompt_prefix = prompt_prefix
 
         inp = ""
         multiline_input = False
@@ -499,11 +594,30 @@ class InputOutput:
             "Navigate forward through history"
             event.current_buffer.history_forward()
 
+        @kb.add("c-x", "c-e")
+        def _(event):
+            "Edit current input in external editor (like Bash)"
+            buffer = event.current_buffer
+            current_text = buffer.text
+
+            # Open the editor with the current text
+            edited_text = pipe_editor(input_data=current_text, suffix="md")
+
+            # Replace the buffer with the edited text, strip any trailing newlines
+            buffer.text = edited_text.rstrip("\n")
+
+            # Move cursor to the end of the text
+            buffer.cursor_position = len(buffer.text)
+
         @kb.add("enter", eager=True, filter=~is_searching)
         def _(event):
             "Handle Enter key press"
-            if self.multiline_mode:
-                # In multiline mode, Enter adds a newline
+            if self.multiline_mode and not (
+                self.editingmode == EditingMode.VI
+                and event.app.vi_state.input_mode == InputMode.NAVIGATION
+            ):
+                # In multiline mode and if not in vi-mode or vi navigation/normal mode,
+                # Enter adds a newline
                 event.current_buffer.insert_text("\n")
             else:
                 # In normal mode, Enter submits
@@ -521,7 +635,7 @@ class InputOutput:
 
         while True:
             if multiline_input:
-                show = ". "
+                show = self.prompt_prefix
 
             try:
                 if self.prompt_session:
@@ -537,7 +651,7 @@ class InputOutput:
                             self.clipboard_watcher.start()
 
                     def get_continuation(width, line_number, is_soft_wrap):
-                        return ". "
+                        return self.prompt_prefix
 
                     line = self.prompt_session.prompt(
                         show,
@@ -641,9 +755,14 @@ class InputOutput:
         if not self.llm_history_file:
             return
         timestamp = datetime.now().isoformat(timespec="seconds")
-        with open(self.llm_history_file, "a", encoding=self.encoding) as log_file:
-            log_file.write(f"{role.upper()} {timestamp}\n")
-            log_file.write(content + "\n")
+        try:
+            Path(self.llm_history_file).parent.mkdir(parents=True, exist_ok=True)
+            with open(self.llm_history_file, "a", encoding="utf-8") as log_file:
+                log_file.write(f"{role.upper()} {timestamp}\n")
+                log_file.write(content + "\n")
+        except (PermissionError, OSError) as err:
+            self.tool_warning(f"Unable to write to llm history file {self.llm_history_file}: {err}")
+            self.llm_history_file = None
 
     def display_user_input(self, inp):
         if self.pretty and self.user_input_color:
@@ -695,6 +814,9 @@ class InputOutput:
         allow_never=False,
     ):
         self.num_user_asks += 1
+
+        # Ring the bell if needed
+        self.ring_bell()
 
         question_id = (question, subject)
 
@@ -750,14 +872,19 @@ class InputOutput:
             self.user_input(f"{question}{res}", log_only=False)
         else:
             while True:
-                if self.prompt_session:
-                    res = self.prompt_session.prompt(
-                        question,
-                        style=style,
-                        complete_while_typing=False,
-                    )
-                else:
-                    res = input(question)
+                try:
+                    if self.prompt_session:
+                        res = self.prompt_session.prompt(
+                            question,
+                            style=style,
+                            complete_while_typing=False,
+                        )
+                    else:
+                        res = input(question)
+                except EOFError:
+                    # Treat EOF (Ctrl+D) as if the user pressed Enter
+                    res = default
+                    break
 
                 if not res:
                     res = default
@@ -801,6 +928,9 @@ class InputOutput:
     def prompt_ask(self, question, default="", subject=None):
         self.num_user_asks += 1
 
+        # Ring the bell if needed
+        self.ring_bell()
+
         if subject:
             self.tool_output()
             self.tool_output(subject, bold=True)
@@ -812,15 +942,19 @@ class InputOutput:
         elif self.yes is False:
             res = "no"
         else:
-            if self.prompt_session:
-                res = self.prompt_session.prompt(
-                    question + " ",
-                    default=default,
-                    style=style,
-                    complete_while_typing=True,
-                )
-            else:
-                res = input(question + " ")
+            try:
+                if self.prompt_session:
+                    res = self.prompt_session.prompt(
+                        question + " ",
+                        default=default,
+                        style=style,
+                        complete_while_typing=True,
+                    )
+                else:
+                    res = input(question + " ")
+            except EOFError:
+                # Treat EOF (Ctrl+D) as if the user pressed Enter
+                res = default
 
         hist = f"{question.strip()} {res.strip()}"
         self.append_chat_history(hist, linebreak=True, blockquote=True)
@@ -840,6 +974,7 @@ class InputOutput:
 
         if not isinstance(message, Text):
             message = Text(message)
+        color = ensure_hash_prefix(color) if color else None
         style = dict(style=color) if self.pretty and color else dict()
         try:
             self.console.print(message, **style)
@@ -870,18 +1005,26 @@ class InputOutput:
         style = dict()
         if self.pretty:
             if self.tool_output_color:
-                style["color"] = self.tool_output_color
+                style["color"] = ensure_hash_prefix(self.tool_output_color)
             style["reverse"] = bold
 
         style = RichStyle(**style)
         self.console.print(*messages, style=style)
 
     def get_assistant_mdstream(self):
-        mdargs = dict(style=self.assistant_output_color, code_theme=self.code_theme)
+        mdargs = dict(
+            style=self.assistant_output_color,
+            code_theme=self.code_theme,
+            inline_code_lexer="text",
+        )
         mdStream = MarkdownStream(mdargs=mdargs)
         return mdStream
 
     def assistant_output(self, message, pretty=None):
+        if not message:
+            self.tool_warning("Empty response received from LLM. Check your provider account?")
+            return
+
         show_resp = message
 
         # Coder will force pretty off if fence is not triple-backticks
@@ -893,7 +1036,7 @@ class InputOutput:
                 message, style=self.assistant_output_color, code_theme=self.code_theme
             )
         else:
-            show_resp = Text(message or "<no response>")
+            show_resp = Text(message or "(empty response)")
 
         self.console.print(show_resp)
 
@@ -903,6 +1046,61 @@ class InputOutput:
 
     def print(self, message=""):
         print(message)
+
+    def llm_started(self):
+        """Mark that the LLM has started processing, so we should ring the bell on next input"""
+        self.bell_on_next_input = True
+
+    def get_default_notification_command(self):
+        """Return a default notification command based on the operating system."""
+        import platform
+
+        system = platform.system()
+
+        if system == "Darwin":  # macOS
+            # Check for terminal-notifier first
+            if shutil.which("terminal-notifier"):
+                return f"terminal-notifier -title 'Aider' -message '{NOTIFICATION_MESSAGE}'"
+            # Fall back to osascript
+            return (
+                f'osascript -e \'display notification "{NOTIFICATION_MESSAGE}" with title "Aider"\''
+            )
+        elif system == "Linux":
+            # Check for common Linux notification tools
+            for cmd in ["notify-send", "zenity"]:
+                if shutil.which(cmd):
+                    if cmd == "notify-send":
+                        return f"notify-send 'Aider' '{NOTIFICATION_MESSAGE}'"
+                    elif cmd == "zenity":
+                        return f"zenity --notification --text='{NOTIFICATION_MESSAGE}'"
+            return None  # No known notification tool found
+        elif system == "Windows":
+            # PowerShell notification
+            return (
+                "powershell -command"
+                " \"[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms');"
+                f" [System.Windows.Forms.MessageBox]::Show('{NOTIFICATION_MESSAGE}',"
+                " 'Aider')\""
+            )
+
+        return None  # Unknown system
+
+    def ring_bell(self):
+        """Ring the terminal bell if needed and clear the flag"""
+        if self.bell_on_next_input and self.notifications:
+            if self.notifications_command:
+                try:
+                    result = subprocess.run(
+                        self.notifications_command, shell=True, capture_output=True
+                    )
+                    if result.returncode != 0 and result.stderr:
+                        error_msg = result.stderr.decode("utf-8", errors="replace")
+                        self.tool_warning(f"Failed to run notifications command: {error_msg}")
+                except Exception as e:
+                    self.tool_warning(f"Failed to run notifications command: {e}")
+            else:
+                print("\a", end="", flush=True)  # Ring the bell
+            self.bell_on_next_input = False  # Clear the flag
 
     def toggle_multiline_mode(self):
         """Toggle between normal and multiline input modes"""
@@ -929,6 +1127,7 @@ class InputOutput:
             text += "\n"
         if self.chat_history_file is not None:
             try:
+                self.chat_history_file.parent.mkdir(parents=True, exist_ok=True)
                 with self.chat_history_file.open("a", encoding=self.encoding, errors="ignore") as f:
                     f.write(text)
             except (PermissionError, OSError) as err:
@@ -961,18 +1160,19 @@ class InputOutput:
             ro_paths = []
             for rel_path in read_only_files:
                 abs_path = os.path.abspath(os.path.join(self.root, rel_path))
-                ro_paths.append(abs_path if len(abs_path) < len(rel_path) else rel_path)
+                ro_paths.append(Text(abs_path if len(abs_path) < len(rel_path) else rel_path))
 
-            files_with_label = ["Readonly:"] + ro_paths
+            files_with_label = [Text("Readonly:")] + ro_paths
             read_only_output = StringIO()
             Console(file=read_only_output, force_terminal=False).print(Columns(files_with_label))
             read_only_lines = read_only_output.getvalue().splitlines()
             console.print(Columns(files_with_label))
 
         if editable_files:
-            files_with_label = editable_files
+            text_editable_files = [Text(f) for f in editable_files]
+            files_with_label = text_editable_files
             if read_only_files:
-                files_with_label = ["Editable:"] + editable_files
+                files_with_label = [Text("Editable:")] + text_editable_files
                 editable_output = StringIO()
                 Console(file=editable_output, force_terminal=False).print(Columns(files_with_label))
                 editable_lines = editable_output.getvalue().splitlines()
