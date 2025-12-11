@@ -44,13 +44,14 @@ These steps only need to be done once.
 ```
 # Clone the aider repo
 git clone https://github.com/Eloitor/aider-arturo
+cd aider-arturo
 
 # Create the scratch dir to hold benchmarking results inside the main aider dir:
 cd aider
 mkdir -p tmp.benchmarks/arturo-benchmark
 
 # Clone the repo with the exercises
-git clone https://github.com/https://github.com/exercism/arturo tmp.benchmarks/arturo-benchmark/arturo
+git clone https://github.com/exercism/arturo tmp.benchmarks/arturo-benchmark/arturo
 
 # Build the docker container
 ./benchmark/docker_build.sh
