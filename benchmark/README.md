@@ -43,14 +43,14 @@ These steps only need to be done once.
 
 ```
 # Clone the aider repo
-git clone https://github.com/Aider-AI/aider.git
+git clone https://github.com/Eloitor/aider-arturo
 
 # Create the scratch dir to hold benchmarking results inside the main aider dir:
 cd aider
-mkdir tmp.benchmarks
+mkdir -p tmp.benchmarks/arturo-benchmark
 
 # Clone the repo with the exercises
-git clone https://github.com/Aider-AI/polyglot-benchmark tmp.benchmarks/polyglot-benchmark
+git clone https://github.com/https://github.com/exercism/arturo tmp.benchmarks/arturo-benchmark/arturo
 
 # Build the docker container
 ./benchmark/docker_build.sh
@@ -69,7 +69,7 @@ Launch the docker container and run the benchmark inside it:
 pip install -e .[dev]
 
 # Run the benchmark:
-./benchmark/benchmark.py a-helpful-name-for-this-run --model gpt-3.5-turbo --edit-format whole --threads 10 --exercises-dir polyglot-benchmark
+./benchmark/benchmark.py a-helpful-name-for-this-run --model gpt-3.5-turbo --edit-format whole --threads 10 --exercises-dir arturo-benchmark
 ```
 
 The above will create a folder `tmp.benchmarks/YYYY-MM-DD-HH-MM-SS--a-helpful-name-for-this-run` with benchmarking results.
